@@ -1,7 +1,8 @@
 using CustomerSupport.Api.DTOs;
+using CustomerSupport.Api.Orchestration;
 using CustomerSupport.Api.Repositories;
+using CustomerSupport.Api.Services;
 using Microsoft.AspNetCore.Mvc;
-using System.Text.RegularExpressions;
 
 namespace CustomerSupport.Api.Controllers;
 
@@ -10,71 +11,231 @@ namespace CustomerSupport.Api.Controllers;
 public class ChatController : ControllerBase
 {
     private readonly ICustomerSupportRepository _repository;
+    private readonly ILlmChatOrchestrator _orchestrator;
+    private readonly IChatMemoryService _memory;
 
-    public ChatController(ICustomerSupportRepository repository)
+    public ChatController(
+        ICustomerSupportRepository repository,
+        ILlmChatOrchestrator orchestrator,
+        IChatMemoryService memory)
     {
         _repository = repository;
+        _orchestrator = orchestrator;
+        _memory = memory;
     }
 
     [HttpPost]
     public async Task<ActionResult<ChatResponseDto>> Chat([FromBody] ChatRequestDto request)
     {
-        var message = request.Message.ToLower();
-
-        var numberMatch = Regex.Match(message, @"\d+");
-        var id = numberMatch.Success ? int.Parse(numberMatch.Value) : 0;
-
-        if (message.Contains("pending refunds"))
+        if (request == null || string.IsNullOrWhiteSpace(request.Message))
         {
-            var data = await _repository.GetPendingRefundsAsync();
-            return Ok(new ChatResponseDto { ToolUsed = "get_pending_refunds", Data = data, Message = "Here are pending refunds." });
+            return BadRequest(new ChatResponseDto
+            {
+                ToolUsed = "none",
+                Message = "Please enter a message."
+            });
         }
 
-        if (id == 0)
+        var sessionId = string.IsNullOrWhiteSpace(request.SessionId)
+            ? "default"
+            : request.SessionId;
+
+        var history = _memory.GetHistory(sessionId);
+
+        _memory.AddMessage(sessionId, "user", request.Message);
+
+        var decision = await _orchestrator.DecideAsync(request.Message, history);
+
+        if (decision.Action == "ask_user")
         {
-            return BadRequest(new ChatResponseDto { ToolUsed = "none", Message = "Please provide an id." });
+            _memory.AddMessage(sessionId, "assistant", decision.FollowUpQuestion);
+
+            return Ok(new ChatResponseDto
+            {
+                ToolUsed = "collect_missing_details",
+                Message = decision.FollowUpQuestion
+            });
         }
 
-        if (message.Contains("where") && message.Contains("order") || message.Contains("summary") && message.Contains("order"))
+        if (decision.Action == "unsupported")
         {
-            var data = await _repository.GetOrderSummaryAsync(id);
-            return Ok(new ChatResponseDto { ToolUsed = "get_order_summary", Data = data, Message = "Here is the order summary." });
+            _memory.AddMessage(sessionId, "assistant", decision.FollowUpQuestion);
+
+            return Ok(new ChatResponseDto
+            {
+                ToolUsed = "unsupported",
+                Message = decision.FollowUpQuestion
+            });
         }
 
-        if (message.Contains("payment"))
+        var results = new List<object>();
+
+        foreach (var tool in decision.Tools)
         {
-            var data = await _repository.GetPaymentStatusAsync(id);
-            return Ok(new ChatResponseDto { ToolUsed = "get_payment_status", Data = data, Message = "Here is the payment status." });
+            object? data;
+
+            switch (tool.ToolName)
+            {
+                case "get_order_summary":
+                    if (!TryGetOrderId(tool, out var orderSummaryId))
+                        return AskForOrderId(sessionId);
+
+                    data = await _repository.GetOrderSummaryAsync(orderSummaryId);
+                    break;
+
+                case "get_payment_status":
+                    if (!TryGetOrderId(tool, out var paymentOrderId))
+                        return AskForOrderId(sessionId);
+
+                    data = await _repository.GetPaymentStatusAsync(paymentOrderId);
+                    break;
+
+                case "get_shipment_status":
+                    if (!TryGetOrderId(tool, out var shipmentOrderId))
+                        return AskForOrderId(sessionId);
+
+                    data = await _repository.GetShipmentStatusAsync(shipmentOrderId);
+                    break;
+
+                case "get_return_status":
+                    if (!TryGetOrderId(tool, out var returnOrderId))
+                        return AskForOrderId(sessionId);
+
+                    data = await _repository.GetReturnStatusAsync(returnOrderId);
+                    break;
+
+                case "get_customer_overview":
+                    if (!TryGetCustomerId(tool, out var overviewCustomerId))
+                        return AskForCustomerId(sessionId);
+
+                    data = await _repository.GetCustomerOverviewAsync(overviewCustomerId);
+                    break;
+
+                case "get_customer_order_history":
+                    if (!TryGetCustomerId(tool, out var historyCustomerId))
+                        return AskForCustomerId(sessionId);
+
+                    data = await _repository.GetCustomerOrderHistoryAsync(historyCustomerId);
+                    break;
+
+                case "get_pending_refunds":
+                    data = await _repository.GetPendingRefundsAsync();
+                    break;
+
+                case "search_products":
+                    if (string.IsNullOrWhiteSpace(tool.SearchText))
+                    {
+                        var msg = "Please tell me what product, brand, or category you want to search.";
+                        _memory.AddMessage(sessionId, "assistant", msg);
+
+                        return Ok(new ChatResponseDto
+                        {
+                            ToolUsed = "collect_missing_details",
+                            Message = msg
+                        });
+                    }
+
+                    data = await _repository.SearchProductsAsync(tool.SearchText);
+                    break;
+
+                case "get_all_customers":
+                    data = await _repository.GetAllCustomersAsync();
+                    break;
+
+                case "get_all_orders":
+                    data = await _repository.GetAllOrdersAsync();
+                    break;
+
+                case "get_all_payments":
+                    data = await _repository.GetAllPaymentsAsync();
+                    break;
+
+                case "get_all_shipments":
+                    data = await _repository.GetAllShipmentsAsync();
+                    break;
+
+                case "get_all_returns":
+                    data = await _repository.GetAllReturnsAsync();
+                    break;
+
+                case "get_all_products":
+                    data = await _repository.GetAllProductsAsync();
+                    break;
+
+                default:
+                    var unsupportedMsg = $"The selected tool '{tool.ToolName}' is not supported.";
+                    _memory.AddMessage(sessionId, "assistant", unsupportedMsg);
+
+                    return Ok(new ChatResponseDto
+                    {
+                        ToolUsed = "unsupported",
+                        Message = unsupportedMsg
+                    });
+            }
+
+            results.Add(new
+            {
+                Tool = tool.ToolName,
+                Data = data
+            });
         }
 
-        if (message.Contains("shipment") || message.Contains("tracking") || message.Contains("delivery"))
-        {
-            var data = await _repository.GetShipmentStatusAsync(id);
-            return Ok(new ChatResponseDto { ToolUsed = "get_shipment_status", Data = data, Message = "Here is the shipment status." });
-        }
+        var finalMessage = await _orchestrator.GenerateFinalResponseAsync(
+    request.Message,
+    results
+);
 
-        if (message.Contains("refund") || message.Contains("return"))
-        {
-            var data = await _repository.GetReturnStatusAsync(id);
-            return Ok(new ChatResponseDto { ToolUsed = "get_return_status", Data = data, Message = "Here is the return/refund status." });
-        }
-
-        if (message.Contains("customer") && message.Contains("overview"))
-        {
-            var data = await _repository.GetCustomerOverviewAsync(id);
-            return Ok(new ChatResponseDto { ToolUsed = "get_customer_overview", Data = data, Message = "Here is the customer overview." });
-        }
-
-        if (message.Contains("orders") && message.Contains("customer"))
-        {
-            var data = await _repository.GetCustomerOrderHistoryAsync(id);
-            return Ok(new ChatResponseDto { ToolUsed = "get_customer_order_history", Data = data, Message = "Here are customer orders." });
-        }
+        _memory.AddMessage(sessionId, "assistant", finalMessage);
 
         return Ok(new ChatResponseDto
         {
-            ToolUsed = "none",
-            Message = "I could not understand which tool to call."
+            ToolUsed = string.Join(", ", decision.Tools.Select(t => t.ToolName)),
+            Data = results,
+            Message = finalMessage
+        });
+    }
+
+    private bool TryGetOrderId(ToolCallRequest tool, out int orderId)
+    {
+        orderId = 0;
+
+        if (tool.OrderId == null)
+            return false;
+
+        return int.TryParse(tool.OrderId.ToString(), out orderId);
+    }
+
+    private bool TryGetCustomerId(ToolCallRequest tool, out int customerId)
+    {
+        customerId = 0;
+
+        if (tool.CustomerId == null)
+            return false;
+
+        return int.TryParse(tool.CustomerId.ToString(), out customerId);
+    }
+
+    private OkObjectResult AskForOrderId(string sessionId)
+    {
+        var msg = "Please provide the order ID so I can continue.";
+        _memory.AddMessage(sessionId, "assistant", msg);
+
+        return Ok(new ChatResponseDto
+        {
+            ToolUsed = "collect_missing_details",
+            Message = msg
+        });
+    }
+
+    private OkObjectResult AskForCustomerId(string sessionId)
+    {
+        var msg = "Please provide the customer ID so I can continue.";
+        _memory.AddMessage(sessionId, "assistant", msg);
+
+        return Ok(new ChatResponseDto
+        {
+            ToolUsed = "collect_missing_details",
+            Message = msg
         });
     }
 }

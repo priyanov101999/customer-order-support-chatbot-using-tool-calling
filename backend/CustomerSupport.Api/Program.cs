@@ -1,6 +1,8 @@
 using CustomerSupport.Api.Data;
 using CustomerSupport.Api.Repositories;
-
+using DotNetEnv;
+using CustomerSupport.Api.Services; 
+Env.Load();
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddControllers();
@@ -9,6 +11,8 @@ builder.Services.AddSwaggerGen();
 
 builder.Services.AddSingleton<DatabaseContext>();
 builder.Services.AddScoped<ICustomerSupportRepository, CustomerSupportRepository>();
+builder.Services.AddScoped<ILlmChatOrchestrator, OpenAiChatOrchestrator>();
+builder.Services.AddSingleton<IChatMemoryService, InMemoryChatMemoryService>();
 
 
 builder.Services.AddCors(options =>
