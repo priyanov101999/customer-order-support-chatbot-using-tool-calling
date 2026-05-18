@@ -1,16 +1,20 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
-type ChatMessage = {
-  role: "user" | "bot";
-  text: string;
-};
+import type { ChatMessage } from "./types/chat";
+import type { PendingIntent } from "./utils/chatHelpers";
 
-type ChatResponse = {
-  toolUsed?: string;
-  data?: unknown;
-  message?: string;
-};
+import {
+  buildMessageForApi,
+  createSessionId,
+  formatBotReply,
+} from "./utils/chatHelpers";
+
+import { sendChatMessage } from "./api/chatApi";
+
+import ChatHeader from "./components/ChatHeader";
+import ChatBox from "./components/ChatBox";
+import ChatInput from "./components/ChatInput";
 
 function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -22,6 +26,26 @@ function App() {
 
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [pendingIntent, setPendingIntent] = useState<PendingIntent>(null);
+  const [sessionId, setSessionId] = useState(createSessionId());
+
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const clearChat = () => {
+    setSessionId(createSessionId());
+    setPendingIntent(null);
+
+    setMessages([
+      {
+        role: "bot",
+        text: "New chat started. Ask me about orders, shipping, returns, refunds, or products.",
+      },
+    ]);
+  };
 
   const sendMessage = async () => {
     if (!input.trim() || loading) return;
@@ -31,32 +55,30 @@ function App() {
       text: input.trim(),
     };
 
+    const { finalMessage, nextPendingIntent } = buildMessageForApi(
+      userMessage.text,
+      messages,
+      pendingIntent
+    );
+
+    console.log("FINAL MESSAGE SENT TO BACKEND:", finalMessage);
+
+    setPendingIntent(nextPendingIntent);
     setMessages((prev) => [...prev, userMessage]);
     setInput("");
     setLoading(true);
 
     try {
-      const response = await fetch(
-        `${import.meta.env.VITE_API_BASE_URL}/api/chat`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            message: userMessage.text,
-          }),
-        }
-      );
+      const data = await sendChatMessage(sessionId, finalMessage);
 
-      const data: ChatResponse = await response.json();
-
-      console.log("API status:", response.status);
-      console.log("API response:", data);
+      console.log("FULL BACKEND RESPONSE:", data);
+      console.log("TOOL USED:", data.toolUsed);
+      console.log("DATA RETURNED:", data.data);
 
       const botMessage: ChatMessage = {
         role: "bot",
-        text: data.message ?? "No response received.",
+        text: formatBotReply(data),
+        files: data.files ?? [],
       };
 
       setMessages((prev) => [...prev, botMessage]);
@@ -78,46 +100,20 @@ function App() {
   return (
     <div className="page">
       <div className="chat-container">
-        <h1>Customer Support Chatbot</h1>
+        <ChatHeader sessionId={sessionId} clearChat={clearChat} />
 
-        <div className="chat-box">
-          {messages.map((msg, index) => (
-            <div
-              key={index}
-              className={`message-row ${
-                msg.role === "user" ? "user-row" : "bot-row"
-              }`}
-            >
-              <div className={`message ${msg.role}`}>{msg.text}</div>
-            </div>
-          ))}
+        <ChatBox
+          messages={messages}
+          loading={loading}
+          bottomRef={bottomRef}
+        />
 
-          {loading && (
-            <div className="message-row bot-row">
-              <div className="message bot">Thinking...</div>
-            </div>
-          )}
-        </div>
-
-        <div className="input-area">
-          <input
-              type="text"
-              value={input}
-              disabled={false}
-              onChange={(e) => {
-                console.log("Typing:", e.target.value);
-                setInput(e.target.value);
-              }}
-              placeholder="Ask about your order, e.g. Where is order 1?"
-              onKeyDown={(e) => {
-                if (e.key === "Enter") sendMessage();
-              }}
-            />
-
-          <button onClick={sendMessage} disabled={loading}>
-            Send
-          </button>
-        </div>
+        <ChatInput
+          input={input}
+          setInput={setInput}
+          sendMessage={sendMessage}
+          loading={loading}
+        />
       </div>
     </div>
   );
